@@ -184,6 +184,13 @@ manifest, so a "successful" run always means a genuinely multi-arch image.
   is why PR builds (single platform, `push: false`) load locally and published
   builds push by digest.
 - **`fail-fast: false`** so one broken architecture does not cancel the other.
+- **A tag rule set can match nothing.** A non-semver tag (`v1`) matches no
+  `type=semver` rule, and `imagetools create` refuses to push untagged. The
+  `prepare` job falls back to `sha-<short>` and warns instead of failing in
+  `merge`.
+- **Provenance and SBOM survive the digest merge.** Verified on this repo:
+  `imagetools create` keeps one `attestation-manifest` per platform in the final
+  index, so pull-time attestation inspection works for both architectures.
 
 ## Alternatives worth knowing
 

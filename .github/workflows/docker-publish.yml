@@ -130,7 +130,7 @@ jobs:
       packages: write
     outputs:
       image: ${{ steps.normalize.outputs.image }}
-      tags: ${{ steps.meta.outputs.tags }}
+      tags: ${{ steps.tags.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
       version: ${{ steps.meta.outputs.json }}
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -160,6 +160,24 @@ jobs:
           sep-tags: " "
           flavor: |
             latest=false
+
+      # A manifest list cannot be pushed without at least one tag, and a tag
+      # rule set can legitimately match nothing (a non-semver tag such as `v1`,
+      # or a custom rule list). Fall back to the commit SHA instead of failing
+      # deep inside the merge job.
+      - name: Ensure at least one tag
+        id: tags
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE: ${{ steps.normalize.outputs.image }}
+        run: |
+          set -euo pipefail
+          tags="$(printf '%s' "$META_TAGS" | tr '\n' ' ' | xargs)"
+          if [ -z "$tags" ]; then
+            tags="${IMAGE}:sha-$(printf '%s' "$GITHUB_SHA" | cut -c1-7)"
+            echo "::warning::no tag rule matched ${GITHUB_REF}; falling back to ${tags}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
 
       # Turn "linux/amd64,linux/arm64" into a build matrix that also carries the
       # runner label and the expected machine architecture for the test step.
@@ -357,6 +375,10 @@ jobs:
           for tag in $TAGS; do
             args+=(-t "$tag")
           done
+          if [ ${#args[@]} -eq 0 ]; then
+            echo "::error::no tags resolved for $IMAGE; nothing to publish"
+            exit 1
+          fi
           sources=()
           for digest in *; do
             sources+=("${IMAGE}@sha256:${digest}")
