@@ -1,0 +1,408 @@
+name: Build and publish a multi-arch container image
+
+# Reusable workflow: builds a Dockerfile once per target platform on native
+# GitHub-hosted runners, pushes each platform by digest, then assembles a single
+# multi-arch manifest list and publishes it to a registry (GHCR by default).
+#
+# Why digests instead of one big cross-platform build:
+#   * No QEMU emulation for arm64 - each platform builds on its own native CPU.
+#   * Platforms build in parallel, so wall-clock time is the slowest platform,
+#     not the sum of all of them.
+#   * Every pushed byte is content-addressed; the final manifest is assembled
+#     from digests that were already verified individually.
+#   See https://docs.docker.com/build/building/multi-platform/
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: 'Target image reference without tag, e.g. ghcr.io/org/repo. Defaults to the calling repository on GHCR.'
+        type: string
+        required: false
+        default: ''
+      dockerfile:
+        description: 'Path to the Dockerfile, relative to the repository root.'
+        type: string
+        required: false
+        default: 'Dockerfile'
+      context:
+        description: 'Build context directory.'
+        type: string
+        required: false
+        default: '.'
+      platforms:
+        description: 'Comma-separated platform list. arm64 goes to the arm runner, everything else to the amd64 runner.'
+        type: string
+        required: false
+        default: 'linux/amd64,linux/arm64'
+      registry:
+        description: 'Registry hostname used for docker login. Set to empty string to skip login (public/OCI output).'
+        type: string
+        required: false
+        default: 'ghcr.io'
+      push:
+        description: 'Push the image. Set to false on pull requests: the image is then built and loaded locally only.'
+        type: boolean
+        required: false
+        default: true
+      tags:
+        description: 'docker/metadata-action tag rules (multiline). Applied to the merged manifest.'
+        type: string
+        required: false
+        default: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,format=short,prefix=sha-
+          type=raw,value=latest,enable={{is_default_branch}}
+      labels:
+        description: 'Extra OCI labels (multiline, LABEL=VALUE). Merged with the metadata-action defaults.'
+        type: string
+        required: false
+        default: ''
+      build-args:
+        description: 'Build arguments (multiline, ARG=VALUE). Never pass secrets here - use secrets: inherit + RUN --mount=type=secret.'
+        type: string
+        required: false
+        default: ''
+      target:
+        description: 'Dockerfile build target stage. Empty builds the final stage.'
+        type: string
+        required: false
+        default: ''
+      test-command:
+        description: 'Optional shell command run once per platform against the freshly built local image ($IMAGE). Use to smoke-test before publishing.'
+        type: string
+        required: false
+        default: ''
+      runner-amd64:
+        description: 'Runner label for amd64-like platforms.'
+        type: string
+        required: false
+        default: 'ubuntu-24.04'
+      runner-arm64:
+        description: 'Runner label for arm64 platforms (native arm runners are free for public repos).'
+        type: string
+        required: false
+        default: 'ubuntu-24.04-arm'
+      cache-scope:
+        description: 'GitHub Actions cache scope. Defaults to the calling repository name so forks and branches do not collide.'
+        type: string
+        required: false
+        default: ''
+      provenance:
+        description: 'BuildKit provenance level pushed to the registry (mode=min, mode=max, false).'
+        type: string
+        required: false
+        default: 'mode=max'
+      sbom:
+        description: 'Attach a BuildKit SBOM attestation to each pushed manifest.'
+        type: boolean
+        required: false
+        default: true
+    outputs:
+      image:
+        description: 'Fully resolved lowercase image name without tag.'
+        value: ${{ jobs.prepare.outputs.image }}
+      version:
+        description: 'JSON of the docker/metadata-action outputs (tags, labels, version components).'
+        value: ${{ jobs.prepare.outputs.version }}
+      tags:
+        description: 'Newline-separated list of published tags.'
+        value: ${{ jobs.prepare.outputs.tags }}
+      digest:
+        description: 'Digest of the merged multi-arch manifest list.'
+        value: ${{ jobs.merge.outputs.digest }}
+
+# Least privilege. `packages: write` is what publishing to GHCR needs; nothing
+# else is required unless you enable GitHub-native attestations at the caller.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.normalize.outputs.image }}
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+      version: ${{ steps.meta.outputs.json }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # Registries require a lowercase repository path; GitHub organisations and
+      # usernames may contain uppercase characters.
+      - name: Normalize image name
+        id: normalize
+        env:
+          INPUT_IMAGE: ${{ inputs.image }}
+          DEFAULT_IMAGE: ${{ inputs.registry }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="${INPUT_IMAGE:-$DEFAULT_IMAGE}"
+          echo "image=$(printf '%s' "$image" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.normalize.outputs.image }}
+          tags: ${{ inputs.tags }}
+          labels: ${{ inputs.labels }}
+          sep-tags: " "
+          flavor: |
+            latest=false
+
+      # Turn "linux/amd64,linux/arm64" into a build matrix that also carries the
+      # runner label and the expected machine architecture for the test step.
+      - name: Build platform matrix
+        id: matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+          RUNNER_AMD64: ${{ inputs.runner-amd64 }}
+          RUNNER_ARM64: ${{ inputs.runner-arm64 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+
+          raw = os.environ["PLATFORMS"]
+          amd_runner = os.environ["RUNNER_AMD64"]
+          arm_runner = os.environ["RUNNER_ARM64"]
+
+          rows = []
+          for platform in (p.strip() for p in raw.split(",")):
+              if not platform:
+                  continue
+              parts = platform.split("/")
+              if len(parts) < 2:
+                  raise SystemExit(f"invalid platform: {platform!r} (expected os/arch[/variant])")
+              arch = parts[1]
+              native_arm = arch == "arm64"
+              rows.append(
+                  {
+                      "platform": platform,
+                      "pair": platform.replace("/", "-"),
+                      "arch": arch,
+                      "runner": arm_runner if native_arm else amd_runner,
+                      # uname -m inside the container
+                      "machine": "aarch64" if native_arm else "x86_64",
+                      # emulation needed for non-arm64 (e.g. linux/arm/v7)
+                      "native": native_arm or arch in ("amd64", "386"),
+                  }
+              )
+
+          if not rows:
+              raise SystemExit("no platforms requested")
+
+          print("matrix=" + json.dumps({"include": rows}))
+          PY
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      PLATFORM: ${{ matrix.platform }}
+      PLATFORM_PAIR: ${{ matrix.pair }}
+      CACHE_SCOPE: ${{ inputs.cache-scope || github.repository }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # push-by-digest needs a container driver, which setup-buildx provides.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Only needed for platforms that are not native to the runner.
+      - name: Set up QEMU
+        if: ${{ !matrix.native }}
+        uses: docker/setup-qemu-action@v4
+
+      - name: Log in to the registry
+        if: ${{ inputs.registry != '' }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          target: ${{ inputs.target }}
+          platforms: ${{ matrix.platform }}
+          labels: ${{ needs.prepare.outputs.labels }}
+          build-args: ${{ inputs.build-args }}
+          provenance: ${{ inputs.provenance }}
+          sbom: ${{ inputs.sbom }}
+          cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}-${{ matrix.pair }}
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE_SCOPE }}-${{ matrix.pair }}
+          # When not publishing, load into the runner so tests can run against it.
+          push: ${{ inputs.push }}
+          load: ${{ !inputs.push }}
+          outputs: ${{ inputs.push && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', needs.prepare.outputs.image) || '' }}
+
+      # Second, cache-warm build used only for testing. It shares the cache scope
+      # above, so it costs a manifest write rather than a rebuild.
+      - name: Build image for testing
+        if: ${{ inputs.test-command != '' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          target: ${{ inputs.target }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ inputs.build-args }}
+          provenance: false
+          sbom: false
+          load: true
+          push: false
+          tags: multiarch-test:${{ matrix.pair }}
+          cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}-${{ matrix.pair }}
+
+      - name: Run tests
+        if: ${{ inputs.test-command != '' }}
+        env:
+          IMAGE: multiarch-test:${{ matrix.pair }}
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: ${{ inputs.test-command }}
+
+      - name: Export digest
+        if: ${{ inputs.push }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest='${{ steps.push.outputs.digest }}'
+          if [ -z "$digest" ]; then
+            echo "::error::build-push-action returned no digest for $PLATFORM"
+            exit 1
+          fi
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: ${{ inputs.push }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.pair }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge manifest list
+    needs: [prepare, build]
+    if: ${{ inputs.push }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.merge.outputs.digest }}
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to the registry
+        if: ${{ inputs.registry != '' }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # imagetools creates the manifest list from the already-pushed per-platform
+      # digests; nothing is rebuilt or re-uploaded here.
+      - name: Create manifest list and push
+        id: merge
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          TAGS: ${{ needs.prepare.outputs.tags }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(ls -A .)" ]; then
+            echo "::error::no digests to merge"
+            exit 1
+          fi
+
+          args=()
+          for tag in $TAGS; do
+            args+=(-t "$tag")
+          done
+          sources=()
+          for digest in *; do
+            sources+=("${IMAGE}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create "${args[@]}" "${sources[@]}"
+
+          # The digest of the manifest list itself, i.e. what a caller pulls.
+          printf 'digest=%s\n' "$(docker buildx imagetools inspect "$IMAGE" --format '{{json .Manifest}}' | jq -r '.digest')" >> "$GITHUB_OUTPUT"
+
+      # Hard gate: a merge that silently produced a single-platform image is a
+      # regression, so assert every requested platform is present.
+      - name: Verify published platforms
+        env:
+          TAGS: ${{ needs.prepare.outputs.tags }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          first_tag="$(printf '%s' "$TAGS" | tr ' ' '\n' | head -n1)"
+          inspect="$(docker buildx imagetools inspect "$first_tag")"
+          echo "$inspect"
+
+          missing=0
+          for platform in ${PLATFORMS//,/ }; do
+            if ! grep -q "Platform: *${platform}$" <<< "$inspect"; then
+              echo "::error::platform $platform missing from $first_tag"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Write job summary
+        env:
+          TAGS: ${{ needs.prepare.outputs.tags }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          {
+            echo "### Published \`${IMAGE}\`"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Platforms | \`${PLATFORMS}\` |"
+            echo "| Digest | \`${{ steps.merge.outputs.digest }}\` |"
+            echo "| Source | \`${{ github.repository }}@${{ github.sha }}\` |"
+            echo
+            echo '```'
+            printf '%s\n' $TAGS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

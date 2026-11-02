@@ -1,0 +1,42 @@
+name: ci
+
+# Self-test for the reusable workflow in this repository. It is also the
+# reference for how other repositories should call it - copy the `uses:` line
+# and point it at your own image name.
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker:
+    # Calling a reusable workflow that lives in the same repository: a plain
+    # relative `./` path is allowed and always uses the current commit.
+    uses: ./.github/workflows/docker-publish.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      # `image` is omitted on purpose: it defaults to ghcr.io/<this repo>, so
+      # the example keeps working if the repository is renamed or transferred.
+      platforms: linux/amd64,linux/arm64
+      # Pull requests build and test but never publish.
+      push: ${{ github.event_name != 'pull_request' }}
+      tags: |
+        type=ref,event=branch
+        type=ref,event=pr
+        type=semver,pattern={{version}}
+        type=semver,pattern={{major}}.{{minor}}
+        type=raw,value=latest,enable={{is_default_branch}}
+      test-command: |
+        set -euo pipefail
+        docker run --rm "$IMAGE" | grep -F "hello from linux/${EXPECTED_MACHINE}" \
+          || { echo "::error::image runs the wrong architecture"; exit 1; }
+        docker run --rm "$IMAGE" | grep -F "IMAGE_ARCH baked at build time: ${EXPECTED_ARCH}" \
+          || { echo "::error::TARGETARCH was not set correctly during build"; exit 1; }

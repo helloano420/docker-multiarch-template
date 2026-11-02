@@ -1,0 +1,6 @@
+# Build artefacts
+*.log
+.DS_Store
+
+# Local test output
+/out/
