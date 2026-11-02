@@ -222,6 +222,11 @@ then wire up your own caller workflow.
 
 ## Versioning
 
+Every third-party action is pinned to a commit SHA with the release tag in a
+trailing comment, matching the convention in
+[`python-dev-image`](https://github.com/NextGenContributions/python-dev-image/blob/latest/.github/workflows/publish.yaml).
+Bump them with Renovate or `pinact`; do not hand-edit to floating major tags.
+
 Reference the workflow by a moving major tag (`@v1`) for convenience, or by a
 full commit SHA when you need an immutable pin:
 
